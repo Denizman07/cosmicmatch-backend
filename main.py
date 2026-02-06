@@ -2,38 +2,41 @@ import os
 import uuid
 from datetime import datetime
 from typing import Optional
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from openai import OpenAI
-
 # PDF + chart
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# ────────────────────────────────────────────────
+# Stripe ek kısmı
+import stripe
+# ────────────────────────────────────────────────
 
 app = FastAPI(title="CosmicMatch API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=["*", "https://cosmicmatch.co.uk", "http://localhost:3000", "http://localhost:5173"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Stripe anahtarını yükle
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
 # MVP storage (Render disk is ephemeral)
 REPORTS = {}  # report_id -> { "html": str, "pdf_path": str, "created_at": str }
-
 
 class PreviewRequest(BaseModel):
     name: str
@@ -48,11 +51,9 @@ class PreviewRequest(BaseModel):
     partner_birth_time: Optional[str] = None
     desired_text: Optional[str] = None
 
-
 @app.get("/")
 def home():
     return {"ok": True, "message": "CosmicMatch backend is running."}
-
 
 def _prompt_preview(body: PreviewRequest) -> str:
     if body.has_partner:
@@ -67,57 +68,46 @@ Partner:
     else:
         intent = "Write a short teaser preview (70–120 words) about the user's love pattern and the kind of partner that suits them."
         partner_block = f"Desired partner (user words): {body.desired_text or 'Not provided.'}"
-
     return f"""
 You are CosmicMatch, an elegant UK-English astrology-style relationship narrator.
 Write ONLY in UK English. Romantic, mysterious, premium—never childish.
 Subtle Shakespearean cadence is welcome, but do NOT quote Shakespeare directly.
 Do NOT mention AI, APIs, prompts, or systems.
-
 User:
 - Name: {body.name}
 - Age: {body.age}
 - Gender: {body.gender}
 - DOB: {body.birth_date}
 - Birth time: {body.birth_time}
-
 {partner_block}
-
 Task:
 {intent}
-
 Rules:
 - One short paragraph.
 - 2–5 tasteful emojis total (✨🌙🪐💫).
 - End with a line that invites them to unlock the full report.
 """.strip()
 
-
 def _prompt_full_report(body: PreviewRequest) -> str:
-    # Full report text will be used for both HTML page and PDF.
-    # "Hamlet vibe" = elegant gravity, no direct quotes.
     if body.has_partner:
         partner_block = f"""
 Partner:
 - Name: {body.partner_name or "Unknown"}
 - Gender: {body.partner_gender or "Unknown"}
 - DOB: {body.partner_birth_date or "Unknown"}
-- Birth time: {body.partner_birth_time or "Unknown"}
+- Time: {body.partner_birth_time or "Unknown"}
 """.strip()
         task = "Write a full 9-page premium compatibility report for this couple."
     else:
         partner_block = f"Desired partner (user words): {body.desired_text or 'Not provided.'}"
         task = "Write a full 9-page premium love + compatibility style report for the user (no partner provided)."
-
     return f"""
 You are CosmicMatch, a premium UK-English astrologically-inspired relationship writer.
 Write as if a seasoned human expert prepared it—confident, poetic, serious, romantic.
 Subtle Shakespearean gravity (Hamlet-like) is welcome, but do NOT quote Shakespeare directly.
 Do NOT mention AI, APIs, prompts, systems.
-
 Audience: UK customers paying £19.99 for a premium report.
 Style: mystical but grounded, elegant, never cringe, never childish. Use UK spellings.
-
 STRUCTURE:
 Return the report in clean Markdown with these sections (use these exact headings):
 1) Cover
@@ -129,30 +119,23 @@ Return the report in clean Markdown with these sections (use these exact heading
 7) Timing & Near-Future Energy (next 3 months)
 8) Action Steps (practical, emotionally intelligent)
 9) Closing Vow (poetic ending)
-
 Rules:
 - Use 2–6 tasteful emojis per page-equivalent section (✨🌙🪐💫🕯️), not too many.
 - Include a “Scoreboard” with 5 scores (0–10) and a short meaning line for each.
 - Keep it premium and detailed.
 - Never output Turkish.
-
 User:
 - Name: {body.name}
 - Age: {body.age}
 - Gender: {body.gender}
 - DOB: {body.birth_date}
 - Birth time: {body.birth_time}
-
 {partner_block}
-
 Task:
 {task}
 """.strip()
 
-
 def _md_to_simple_html(md: str) -> str:
-    # Very simple Markdown to HTML for MVP (headings + paragraphs + lists).
-    # Good enough to show a premium-looking page; PDF is the "deliverable".
     html_lines = []
     for line in md.splitlines():
         line = line.rstrip()
@@ -198,19 +181,15 @@ def _md_to_simple_html(md: str) -> str:
 </html>
 """.strip()
 
-
 def _make_placeholder_wheel_png(path: str) -> None:
-    # Simple mystical "wheel" placeholder (not Swiss)
     fig = plt.figure(figsize=(4, 4), dpi=200)
     ax = plt.subplot(111, projection="polar")
     ax.set_theta_direction(-1)
     ax.set_theta_zero_location("N")
     ax.set_yticklabels([])
     ax.set_xticklabels([])
-    # draw rings
     for r in [0.25, 0.5, 0.75, 1.0]:
         ax.plot([0, 2 * 3.14159], [r, r], linewidth=1)
-    # spokes
     for i in range(12):
         theta = i * (2 * 3.14159 / 12)
         ax.plot([theta, theta], [0, 1.0], linewidth=1)
@@ -218,18 +197,14 @@ def _make_placeholder_wheel_png(path: str) -> None:
     fig.savefig(path, transparent=True)
     plt.close(fig)
 
-
 def _make_pdf(report_md: str, pdf_path: str, wheel_path: str, title_line: str) -> None:
     c = canvas.Canvas(pdf_path, pagesize=A4)
     w, h = A4
-
     def header(page_title: str):
         c.setFont("Helvetica-Bold", 18)
         c.drawString(18 * mm, h - 22 * mm, page_title)
         c.setFont("Helvetica", 10)
         c.drawString(18 * mm, h - 28 * mm, "CosmicMatch • Premium Compatibility Report")
-
-    # Split into "pages" roughly by headings (MVP)
     blocks = report_md.split("\n## ")
     pages = []
     for i, b in enumerate(blocks):
@@ -237,8 +212,6 @@ def _make_pdf(report_md: str, pdf_path: str, wheel_path: str, title_line: str) -
             pages.append(b.strip())
         else:
             pages.append(("## " + b).strip())
-
-    # Cover page
     header("CosmicMatch ✨")
     c.setFont("Helvetica", 12)
     c.drawString(18 * mm, h - 40 * mm, title_line)
@@ -247,14 +220,10 @@ def _make_pdf(report_md: str, pdf_path: str, wheel_path: str, title_line: str) -
     c.setFont("Helvetica-Oblique", 11)
     c.drawString(18 * mm, h - 160 * mm, "A mystic blueprint of love, written with care.")
     c.showPage()
-
-    # Content pages
     for idx, content in enumerate(pages[:9], start=1):
         header(f"Chapter {idx}")
         y = h - 38 * mm
         c.setFont("Helvetica", 11)
-
-        # simple line wrap
         text = c.beginText(18 * mm, y)
         text.setLeading(14)
         for raw in content.splitlines():
@@ -262,23 +231,16 @@ def _make_pdf(report_md: str, pdf_path: str, wheel_path: str, title_line: str) -
             if line == "":
                 text.textLine("")
                 continue
-            # trim markdown symbols
             line = line.replace("### ", "").replace("## ", "").replace("# ", "")
-            # hard wrap
             while len(line) > 95:
                 text.textLine(line[:95])
                 line = line[95:]
             text.textLine(line)
         c.drawText(text)
-
-        # add wheel on a mid page
         if idx == 5:
             c.drawImage(wheel_path, w - 95 * mm, 30 * mm, width=70 * mm, height=70 * mm, mask="auto")
-
         c.showPage()
-
     c.save()
-
 
 @app.post("/preview")
 def preview(body: PreviewRequest):
@@ -287,41 +249,31 @@ def preview(body: PreviewRequest):
     text = (resp.output_text or "").strip()
     return {"preview": text}
 
-
 @app.post("/generate")
 def generate(body: PreviewRequest):
-    # Full report markdown from AI
     prompt = _prompt_full_report(body)
     resp = client.responses.create(model="gpt-4o-mini", input=prompt)
     report_md = (resp.output_text or "").strip()
     if not report_md:
         raise HTTPException(status_code=500, detail="Empty report from model.")
-
     report_id = uuid.uuid4().hex[:12]
     os.makedirs("/tmp/cosmicmatch", exist_ok=True)
-
     wheel_path = f"/tmp/cosmicmatch/wheel_{report_id}.png"
     pdf_path = f"/tmp/cosmicmatch/report_{report_id}.pdf"
-
     _make_placeholder_wheel_png(wheel_path)
-
     title_line = f"{body.name} & {body.partner_name}" if body.has_partner else f"{body.name}"
     _make_pdf(report_md, pdf_path, wheel_path, title_line)
-
     html = _md_to_simple_html(report_md)
-
     REPORTS[report_id] = {
         "html": html,
         "pdf_path": pdf_path,
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
-
     return {
         "report_id": report_id,
         "report_url": f"/report/{report_id}",
         "pdf_url": f"/download/{report_id}.pdf",
     }
-
 
 @app.get("/report/{report_id}", response_class=HTMLResponse)
 def report(report_id: str):
@@ -330,10 +282,8 @@ def report(report_id: str):
         raise HTTPException(status_code=404, detail="Report not found.")
     return item["html"]
 
-
 @app.get("/download/{filename}")
 def download(filename: str):
-    # expects "xxxx.pdf"
     if not filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Invalid file.")
     report_id = filename.replace(".pdf", "")
@@ -344,3 +294,22 @@ def download(filename: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File missing (server restarted).")
     return FileResponse(path, media_type="application/pdf", filename=f"cosmicmatch_{report_id}.pdf")
+
+# ────────────────────────────────────────────────
+# Senin eklediğin Stripe sonrası endpoint
+@app.get("/after-payment")
+def after_payment(session_id: str):
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe key missing")
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid session_id: {str(e)}")
+    # ödeme tamam mı?
+    paid = (session.payment_status == "paid")
+    if not paid:
+        return {"paid": False}
+    # ✅ burada raporu üret (şimdilik basit örnek)
+    report_text = "✅ Full report generated! (Put your real AI report here.)"
+    return {"paid": True, "report": report_text}
+# ────────────────────────────────────────────────
