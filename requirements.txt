@@ -8,3 +8,7 @@ pytz==2024.1
 
 reportlab==4.2.5
 matplotlib==3.9.2
+
+stripe
+requests
+python-dotenv
